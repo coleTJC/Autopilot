@@ -1134,13 +1134,14 @@ class AutopilotEngine:
             self.artifact_history.popleft()
 
         # track successive diffs for spike detection
-        if self._last_full_band is not None:
-            diff = abs(fb - self._last_full_band)
+        prev_full_band = self._last_full_band
+        if prev_full_band is not None:
+            diff = abs(fb - prev_full_band)
             self._recent_diffs.append(diff)
-        self._last_full_band = fb
 
         # not enough samples yet → no artifact
         if len(self.artifact_history) < ARTIFACT_MIN_SAMPLES:
+            self._last_full_band = fb
             self.artifact_flag = False
             self.artifact_counter = 0
             return
@@ -1158,10 +1159,12 @@ class AutopilotEngine:
             sorted_diffs = sorted(self._recent_diffs)
             median_diff = sorted_diffs[len(sorted_diffs) // 2]
             spike_thresh = max(ARTIFACT_FLAT_EPS * 5.0, median_diff * ARTIFACT_SPIKE_FACTOR)
-            cur_diff = abs(fb - self._last_full_band) if self._last_full_band is not None else 0.0
+            cur_diff = abs(fb - prev_full_band) if prev_full_band is not None else 0.0
             is_spike = cur_diff > spike_thresh
         else:
             is_spike = False
+
+        self._last_full_band = fb
 
         bad_frame = is_flat or is_spike
 
@@ -2171,8 +2174,8 @@ def run_ui():
         try:
             v = float(amplify_var.get()) / 100.0
         except Exception:
-            v = 100.0
-        AMPLIFY_FACTOR = clamp(v / 100.0, 0.5, 3.0)
+            v = 1.0
+        AMPLIFY_FACTOR = clamp(v, 0.5, 3.0)
 
     def on_sound_change(*_):
         global SOUND_ENABLED
