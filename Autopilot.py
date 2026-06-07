@@ -23,6 +23,21 @@ WINDOW_SECONDS = 2.0         # EEG window for band metrics
 PRINT_INTERVAL = 0.3
 LOG_FILE = "autopilot_log.csv"  # will be overwritten by snapshot path
 
+# Raw EEG band derivation. This alternate branch prefers FFT-derived bands from
+# /muse/eeg over Mind Monitor's separate band endpoints once raw bands are ready.
+USE_RAW_EEG_DERIVED_BANDS = True
+EEG_SAMPLE_RATE = 256.0
+FFT_WINDOW_SEC = 1.0
+FFT_WINDOW_SAMPLES = int(EEG_SAMPLE_RATE * FFT_WINDOW_SEC)
+RAW_EEG_BAND_UPDATE_INTERVAL = 0.10
+RAW_EEG_BAND_RANGES = {
+    "delta": (1.0, 4.0),
+    "theta": (4.0, 8.0),
+    "alpha": (8.0, 13.0),
+    "beta":  (13.0, 30.0),
+    "gamma": (30.0, 45.0),
+}
+
 DEFAULT_ARDUINO_PORT = "COM3"
 ARDUINO_BAUD = 115200
 
@@ -862,6 +877,19 @@ class AutopilotEngine:
         self.raw_channels = [0.0, 0.0, 0.0, 0.0]
         self.left_brain_value = 0.5
         self.right_brain_value = 0.5
+        self.raw_eeg_buffers = [
+            deque(maxlen=FFT_WINDOW_SAMPLES),
+            deque(maxlen=FFT_WINDOW_SAMPLES),
+            deque(maxlen=FFT_WINDOW_SAMPLES),
+            deque(maxlen=FFT_WINDOW_SAMPLES),
+        ]
+        self.raw_bands_ready = False
+        self.last_raw_band_time = 0.0
+        self.raw_fft_window = [
+            0.54 - 0.46 * math.cos((2.0 * math.pi * n) / (FFT_WINDOW_SAMPLES - 1))
+            for n in range(FFT_WINDOW_SAMPLES)
+        ]
+        self.raw_fft_tables = self._build_raw_fft_tables()
 
         # spectral holder (per-band per-channel)
         self.band_channels = {
@@ -889,21 +917,101 @@ class AutopilotEngine:
 
     # ---- raw EEG from /muse/eeg ----
 
+    def _build_raw_fft_tables(self):
+        tables = {}
+        bin_hz = EEG_SAMPLE_RATE / FFT_WINDOW_SAMPLES
+        for band_name, (f_low, f_high) in RAW_EEG_BAND_RANGES.items():
+            bins = []
+            k_start = max(1, math.ceil(f_low / bin_hz))
+            k_stop = max(k_start + 1, math.ceil(f_high / bin_hz))
+            for k in range(k_start, k_stop):
+                cos_terms = []
+                sin_terms = []
+                for n in range(FFT_WINDOW_SAMPLES):
+                    angle = (2.0 * math.pi * k * n) / FFT_WINDOW_SAMPLES
+                    cos_terms.append(math.cos(angle))
+                    sin_terms.append(math.sin(angle))
+                bins.append((cos_terms, sin_terms))
+            tables[band_name] = bins
+        return tables
+
+    def _derive_bands_from_raw_eeg(self):
+        """
+        Use the last FFT_WINDOW_SAMPLES raw EEG samples per channel to compute
+        delta/theta/alpha/beta/gamma log power, matching the V2 monitor path.
+        """
+        if any(len(buf) < FFT_WINDOW_SAMPLES for buf in self.raw_eeg_buffers):
+            return None
+
+        channel_data = []
+        for buf in self.raw_eeg_buffers:
+            vals = [float(v) for v in buf]
+            mean_val = sum(vals) / len(vals)
+            channel_data.append([
+                (vals[i] - mean_val) * self.raw_fft_window[i]
+                for i in range(FFT_WINDOW_SAMPLES)
+            ])
+
+        derived = {band_name: [] for band_name in RAW_EEG_BAND_RANGES.keys()}
+        for ch_idx in range(4):
+            samples = channel_data[ch_idx]
+            for band_name, bins in self.raw_fft_tables.items():
+                powers = []
+                for cos_terms, sin_terms in bins:
+                    re = 0.0
+                    im = 0.0
+                    for i, sample in enumerate(samples):
+                        re += sample * cos_terms[i]
+                        im -= sample * sin_terms[i]
+                    powers.append((re * re) + (im * im))
+
+                raw_power = sum(powers) / len(powers) if powers else 0.0
+                derived[band_name].append(math.log10(raw_power + 1e-8))
+
+        return derived
+
+    def _update_raw_derived_bands(self):
+        now = time.monotonic()
+        if now - self.last_raw_band_time < RAW_EEG_BAND_UPDATE_INTERVAL:
+            return False
+
+        derived = self._derive_bands_from_raw_eeg()
+        if derived is None:
+            return False
+
+        self.last_raw_band_time = now
+        self.raw_bands_ready = True
+
+        for band_name, values in derived.items():
+            self.band_channels[band_name] = values
+            self.eeg_window.add_sample(band_name, values)
+
+        return True
+
     def update_raw_eeg(self, values):
         vals = [float(v) for v in values]
         chans = None
-        if len(vals) >= 8:
-            chans = [(vals[i] + vals[i + 4]) / 2.0 for i in range(4)]
-        elif len(vals) >= 4:
+        if len(vals) >= 4:
             chans = vals[:4]
         if chans is None:
             return
         self.raw_channels = chans
-        self._process_sample()
+
+        for i in range(4):
+            self.raw_eeg_buffers[i].append(chans[i])
+
+        if USE_RAW_EEG_DERIVED_BANDS:
+            if self._update_raw_derived_bands():
+                self._process_sample()
+        else:
+            self._process_sample()
 
     # ---- band endpoints ----
 
     def update_band(self, band_name: str, values, chan_index=None):
+        if USE_RAW_EEG_DERIVED_BANDS and self.raw_bands_ready:
+            return
+
         self.eeg_window.add_sample(band_name, values)
 
         vals = [float(v) for v in values]
